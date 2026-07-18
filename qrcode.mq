@@ -1,0 +1,777 @@
+# QR Code encoder for mq
+#
+# Generates QR Code (ISO/IEC 18004) symbols from text/URLs and renders them
+# as ASCII art. Supports versions 1-6 (up to 134 bytes of data at level L),
+# byte mode encoding, and error correction levels L/M/Q/H with automatic
+# mask-pattern selection.
+
+# -- GF(256) tables (primitive polynomial 0x11D, generator 2) --
+
+def _qr_gf_exp_table():
+  [1,2,4,8,16,32,64,128,29,58,116,232,205,135,19,38,76,152,45,90,180,117,234,201,143,3,6,12,24,48,96,192,157,39,78,156,37,74,148,53,106,212,181,119,238,193,159,35,70,140,5,10,20,40,80,160,93,186,105,210,185,111,222,161,95,190,97,194,153,47,94,188,101,202,137,15,30,60,120,240,253,231,211,187,107,214,177,127,254,225,223,163,91,182,113,226,217,175,67,134,17,34,68,136,13,26,52,104,208,189,103,206,129,31,62,124,248,237,199,147,59,118,236,197,151,51,102,204,133,23,46,92,184,109,218,169,79,158,33,66,132,21,42,84,168,77,154,41,82,164,85,170,73,146,57,114,228,213,183,115,230,209,191,99,198,145,63,126,252,229,215,179,123,246,241,255,227,219,171,75,150,49,98,196,149,55,110,220,165,87,174,65,130,25,50,100,200,141,7,14,28,56,112,224,221,167,83,166,81,162,89,178,121,242,249,239,195,155,43,86,172,69,138,9,18,36,72,144,61,122,244,245,247,243,251,235,203,139,11,22,44,88,176,125,250,233,207,131,27,54,108,216,173,71,142,1]
+end
+
+def _qr_gf_log_table():
+  [0,0,1,25,2,50,26,198,3,223,51,238,27,104,199,75,4,100,224,14,52,141,239,129,28,193,105,248,200,8,76,113,5,138,101,47,225,36,15,33,53,147,142,218,240,18,130,69,29,181,194,125,106,39,249,185,201,154,9,120,77,228,114,166,6,191,139,98,102,221,48,253,226,152,37,179,16,145,34,136,54,208,148,206,143,150,219,189,241,210,19,92,131,56,70,64,30,66,182,163,195,72,126,110,107,58,40,84,250,133,186,61,202,94,155,159,10,21,121,43,78,212,229,172,115,243,167,87,7,112,192,247,140,128,99,13,103,74,222,237,49,197,254,24,227,165,153,119,38,184,180,124,17,68,146,217,35,32,137,46,55,63,209,91,149,188,207,205,144,135,151,178,220,252,190,97,242,86,211,171,20,42,93,158,132,60,57,83,71,109,65,162,31,45,67,216,183,123,164,118,196,23,73,236,127,12,111,246,108,161,59,82,41,157,85,170,251,96,134,177,187,204,62,90,203,89,95,176,156,169,160,81,11,245,22,235,122,117,44,215,79,174,213,233,230,231,173,232,116,214,244,234,168,80,88,175]
+end
+
+def _qr_gf_mul(a, b, exp_t, log_t):
+  if (a == 0 || b == 0): 0
+  else: exp_t[mod(log_t[a] + log_t[b], 255)]
+end
+
+# -- Generic integer bit helpers --
+
+def _qr_xor(a, b):
+  var x = a
+  | var y = b
+  | var result = 0
+  | var bitval = 1
+  | let _ = while (x > 0 || y > 0):
+      do
+        let abit = mod(x, 2)
+        | let bbit = mod(y, 2)
+        | result = result + (if (abit != bbit): bitval else: 0)
+        | x = shift_right(x, 1)
+        | y = shift_right(y, 1)
+        | bitval = bitval * 2
+        | result
+      end
+    end
+  | result
+end
+
+def _qr_bit_length(n):
+  var x = n
+  | var c = 0
+  | let _ = while (x > 0):
+      do x = shift_right(x, 1) | c = c + 1 | c end
+    end
+  | c
+end
+
+def _qr_idiv(a, b):
+  floor(div(a, b))
+end
+
+# Returns an array of `length` bits (MSB first) representing `value`.
+def _qr_bits_of(value, length):
+  var bits = []
+  | var i = length - 1
+  | let _ = while (i >= 0):
+      do bits += [mod(shift_right(value, i), 2)] | i = i - 1 | bits end
+    end
+  | bits
+end
+
+def _qr_bit_at(value, i):
+  mod(shift_right(value, i), 2)
+end
+
+# -- Reed-Solomon error correction --
+
+def _qr_poly_mul(p1, p2, exp_t, log_t):
+  let l1 = len(p1)
+  | let l2 = len(p2)
+  | var result = map(range(0, l1 + l2 - 2), fn(x): 0;)
+  | var i = 0
+  | let _ = while (i < l1):
+      do
+        var j = 0
+        | let _ = while (j < l2):
+            do
+              let idx = i + j
+              | let prod = _qr_gf_mul(p1[i], p2[j], exp_t, log_t)
+              | result = set(result, idx, _qr_xor(result[idx], prod))
+              | j = j + 1
+              | result
+            end
+          end
+        | i = i + 1
+        | result
+      end
+    end
+  | result
+end
+
+def _qr_generator_poly(n, exp_t, log_t):
+  var poly = [1]
+  | var i = 0
+  | let _ = while (i < n):
+      do poly = _qr_poly_mul(poly, [1, exp_t[i]], exp_t, log_t) | i = i + 1 | poly end
+    end
+  | poly
+end
+
+def _qr_rs_encode_block(data, ecc_count, exp_t, log_t):
+  let gen = _qr_generator_poly(ecc_count, exp_t, log_t)
+  | let gen_len = len(gen)
+  | let dlen = len(data)
+  | var msg = data + map(range(0, ecc_count - 1), fn(x): 0;)
+  | var i = 0
+  | let _ = while (i < dlen):
+      do
+        let coef = msg[i]
+        | let _ = if (coef != 0):
+            do
+              var j = 0
+              | let _ = while (j < gen_len):
+                  do
+                    let term = _qr_gf_mul(gen[j], coef, exp_t, log_t)
+                    | msg = set(msg, i + j, _qr_xor(msg[i + j], term))
+                    | j = j + 1
+                    | msg
+                  end
+                end
+              | msg
+            end
+          else: msg
+        | i = i + 1
+        | msg
+      end
+    end
+  | slice(msg, dlen, len(msg))
+end
+
+# -- Per-version / per-level codeword layout --
+# Returns [ecc_per_block, group1_blocks, group1_data, group2_blocks, group2_data]
+
+def _qr_block_info(version, level):
+  if (version == 1):
+    if (level == "L"): [7, 1, 19, 0, 0]
+    elif (level == "M"): [10, 1, 16, 0, 0]
+    elif (level == "Q"): [13, 1, 13, 0, 0]
+    elif (level == "H"): [17, 1, 9, 0, 0]
+    else: error("qrcode: invalid error correction level: " + level)
+  elif (version == 2):
+    if (level == "L"): [10, 1, 34, 0, 0]
+    elif (level == "M"): [16, 1, 28, 0, 0]
+    elif (level == "Q"): [22, 1, 22, 0, 0]
+    elif (level == "H"): [28, 1, 16, 0, 0]
+    else: error("qrcode: invalid error correction level: " + level)
+  elif (version == 3):
+    if (level == "L"): [15, 1, 55, 0, 0]
+    elif (level == "M"): [26, 1, 44, 0, 0]
+    elif (level == "Q"): [18, 2, 17, 0, 0]
+    elif (level == "H"): [22, 2, 13, 0, 0]
+    else: error("qrcode: invalid error correction level: " + level)
+  elif (version == 4):
+    if (level == "L"): [20, 1, 80, 0, 0]
+    elif (level == "M"): [18, 2, 32, 0, 0]
+    elif (level == "Q"): [26, 2, 24, 0, 0]
+    elif (level == "H"): [16, 4, 9, 0, 0]
+    else: error("qrcode: invalid error correction level: " + level)
+  elif (version == 5):
+    if (level == "L"): [26, 1, 108, 0, 0]
+    elif (level == "M"): [24, 2, 43, 0, 0]
+    elif (level == "Q"): [18, 2, 15, 2, 16]
+    elif (level == "H"): [22, 2, 11, 2, 12]
+    else: error("qrcode: invalid error correction level: " + level)
+  elif (version == 6):
+    if (level == "L"): [18, 2, 68, 0, 0]
+    elif (level == "M"): [16, 4, 27, 0, 0]
+    elif (level == "Q"): [24, 4, 19, 0, 0]
+    elif (level == "H"): [28, 4, 15, 0, 0]
+    else: error("qrcode: invalid error correction level: " + level)
+  else:
+    error("qrcode: unsupported version (only 1-6 are supported): " + to_string(version))
+end
+
+def _qr_select_version(byte_len, level):
+  var v = 1
+  | var found = -1
+  | let _ = while (v <= 6 && found == -1):
+      do
+        let info = _qr_block_info(v, level)
+        | let capacity_bits = (info[1] * info[2] + info[3] * info[4]) * 8
+        | let needed_bits = 4 + 8 + byte_len * 8
+        | let _ = if (needed_bits <= capacity_bits): found = v else: found
+        | v = v + 1
+        | v
+      end
+    end
+  | if (found == -1):
+      error("qrcode: input too long (" + to_string(byte_len) + " bytes) for supported versions (max version 6)")
+    else: found
+end
+
+# -- Bitstream construction (byte mode) --
+
+def _qr_build_bitstream(byte_arr):
+  let mode_bits = _qr_bits_of(4, 4)
+  | let count_bits = _qr_bits_of(len(byte_arr), 8)
+  | let data_bits = fold(byte_arr, [], fn(acc, b): acc + _qr_bits_of(b, 8);)
+  | mode_bits + count_bits + data_bits
+end
+
+def _qr_pad_bitstream(bits, capacity_bits):
+  let _ = if (len(bits) > capacity_bits):
+      error("qrcode: input too long for the selected version/error correction level")
+    else: 0
+  | let term_len = min(4, capacity_bits - len(bits))
+  | var result = bits + _qr_bits_of(0, term_len)
+  | let rem = mod(len(result), 8)
+  | let pad_zeros = if (rem == 0): 0 else: 8 - rem
+  | result = result + _qr_bits_of(0, pad_zeros)
+  | var toggle = true
+  | let _ = while (len(result) < capacity_bits):
+      do
+        result = result + _qr_bits_of(if (toggle): 236 else: 17, 8)
+        | toggle = !toggle
+        | result
+      end
+    end
+  | result
+end
+
+def _qr_bits_to_bytes(bits):
+  var out = []
+  | var i = 0
+  | let n = len(bits)
+  | let _ = while (i < n):
+      do
+        let byte = fold(range(0, 7), 0, fn(acc, j): acc * 2 + bits[i + j];)
+        | out += [byte]
+        | i = i + 8
+        | out
+      end
+    end
+  | out
+end
+
+def _qr_split_blocks(codewords, g1_blocks, g1_data, g2_blocks, g2_data):
+  var blocks = []
+  | var idx = 0
+  | var i = 0
+  | let _ = while (i < g1_blocks):
+      do blocks += [slice(codewords, idx, idx + g1_data)] | idx = idx + g1_data | i = i + 1 | blocks end
+    end
+  | var j = 0
+  | let _ = while (j < g2_blocks):
+      do blocks += [slice(codewords, idx, idx + g2_data)] | idx = idx + g2_data | j = j + 1 | blocks end
+    end
+  | blocks
+end
+
+def _qr_interleave(blocks):
+  let max_len = fold(blocks, 0, fn(acc, b): max(acc, len(b));)
+  | var result = []
+  | var i = 0
+  | let _ = while (i < max_len):
+      do
+        result = fold(blocks, result, fn(acc, b): if (i < len(b)): acc + [b[i]] else: acc;)
+        | i = i + 1
+        | result
+      end
+    end
+  | result
+end
+
+# -- Matrix helpers --
+
+def _qr_make_matrix(size, fill):
+  map(range(0, size - 1), fn(r): map(range(0, size - 1), fn(c): fill;);)
+end
+
+def _qr_mset(matrix, r, c, value):
+  set(matrix, r, set(matrix[r], c, value))
+end
+
+# -- Finder patterns --
+
+def _qr_finder_pattern(r, c):
+  if (r == 0 || r == 6 || c == 0 || c == 6): 1
+  elif (r == 1 || r == 5 || c == 1 || c == 5): 0
+  else: 1
+end
+
+def _qr_place_finder(modules, reserved, top, left, size):
+  var m = modules
+  | var res = reserved
+  | var r = -1
+  | let _ = while (r <= 7):
+      do
+        var c = -1
+        | let _ = while (c <= 7):
+            do
+              let rr = top + r
+              | let cc = left + c
+              | let _ = if (rr >= 0 && rr < size && cc >= 0 && cc < size):
+                  do
+                    let value = if (r == -1 || r == 7 || c == -1 || c == 7): 0 else: _qr_finder_pattern(r, c)
+                    | m = _qr_mset(m, rr, cc, value)
+                    | res = _qr_mset(res, rr, cc, 1)
+                    | m
+                  end
+                else: m
+              | c = c + 1
+              | c
+            end
+          end
+        | r = r + 1
+        | r
+      end
+    end
+  | [m, res]
+end
+
+# -- Timing patterns --
+
+def _qr_place_timing(modules, reserved, size):
+  var m = modules
+  | var res = reserved
+  | var i = 8
+  | let _ = while (i <= size - 9):
+      do
+        let value = if (mod(i, 2) == 0): 1 else: 0
+        | m = _qr_mset(m, 6, i, value)
+        | res = _qr_mset(res, 6, i, 1)
+        | m = _qr_mset(m, i, 6, value)
+        | res = _qr_mset(res, i, 6, 1)
+        | i = i + 1
+        | m
+      end
+    end
+  | [m, res]
+end
+
+# -- Alignment pattern (versions 2-6 have exactly one) --
+
+def _qr_alignment_pos(version):
+  if (version == 1): -1
+  elif (version == 2): 18
+  elif (version == 3): 22
+  elif (version == 4): 26
+  elif (version == 5): 30
+  elif (version == 6): 34
+  else: error("qrcode: unsupported version: " + to_string(version))
+end
+
+def _qr_place_alignment(modules, reserved, version):
+  let pos = _qr_alignment_pos(version)
+  | if (pos == -1): [modules, reserved]
+    else:
+      do
+        var m = modules
+        | var res = reserved
+        | var dr = -2
+        | let _ = while (dr <= 2):
+            do
+              var dc = -2
+              | let _ = while (dc <= 2):
+                  do
+                    let value = if (dr == -2 || dr == 2 || dc == -2 || dc == 2): 1
+                                elif (dr == 0 && dc == 0): 1
+                                else: 0
+                    | m = _qr_mset(m, pos + dr, pos + dc, value)
+                    | res = _qr_mset(res, pos + dr, pos + dc, 1)
+                    | dc = dc + 1
+                    | dc
+                  end
+                end
+              | dr = dr + 1
+              | dr
+            end
+          end
+        | [m, res]
+      end
+end
+
+# -- Format info area reservation + always-dark module --
+
+def _qr_reserve_format_info(modules, reserved, size):
+  var m = modules
+  | var res = reserved
+  | var i = 0
+  | let _ = while (i <= 8):
+      do
+        res = _qr_mset(res, i, 8, 1)
+        | res = _qr_mset(res, 8, i, 1)
+        | i = i + 1
+        | res
+      end
+    end
+  | var j = size - 8
+  | let _ = while (j <= size - 1):
+      do
+        res = _qr_mset(res, j, 8, 1)
+        | res = _qr_mset(res, 8, j, 1)
+        | j = j + 1
+        | res
+      end
+    end
+  | m = _qr_mset(m, size - 8, 8, 1)
+  | [m, res]
+end
+
+# -- Format info bits (BCH(15,5)) --
+
+def _qr_bch_remainder(data, gen, gen_bits):
+  var value = shift_left(data, gen_bits - 1)
+  | let _ = while (_qr_bit_length(value) >= gen_bits):
+      do
+        let shift = _qr_bit_length(value) - gen_bits
+        | value = _qr_xor(value, shift_left(gen, shift))
+        | value
+      end
+    end
+  | value
+end
+
+def _qr_format_bits(level, mask):
+  let level_bits = if (level == "L"): 1
+                    elif (level == "M"): 0
+                    elif (level == "Q"): 3
+                    elif (level == "H"): 2
+                    else: error("qrcode: invalid error correction level: " + level)
+  | let data = level_bits * 8 + mask
+  | let rem = _qr_bch_remainder(data, 1335, 11)
+  | let combined = data * 1024 + rem
+  | _qr_xor(combined, 21522)
+end
+
+def _qr_place_format(modules, bits15, size):
+  var m = modules
+  | var i = 0
+  | let _ = while (i <= 5):
+      do m = _qr_mset(m, i, 8, _qr_bit_at(bits15, i)) | i = i + 1 | m end
+    end
+  | m = _qr_mset(m, 7, 8, _qr_bit_at(bits15, 6))
+  | m = _qr_mset(m, 8, 8, _qr_bit_at(bits15, 7))
+  | m = _qr_mset(m, 8, 7, _qr_bit_at(bits15, 8))
+  | var k = 9
+  | let _ = while (k <= 14):
+      do m = _qr_mset(m, 8, 14 - k, _qr_bit_at(bits15, k)) | k = k + 1 | m end
+    end
+  | var i2 = 0
+  | let _ = while (i2 <= 7):
+      do m = _qr_mset(m, size - 1 - i2, 8, _qr_bit_at(bits15, i2)) | i2 = i2 + 1 | m end
+    end
+  | var k2 = 8
+  | let _ = while (k2 <= 14):
+      do m = _qr_mset(m, 8, size - 15 + k2, _qr_bit_at(bits15, k2)) | k2 = k2 + 1 | m end
+    end
+  | m = _qr_mset(m, size - 8, 8, 1)
+  | m
+end
+
+# -- Zigzag codeword placement --
+
+def _qr_place_data(modules, reserved, codeword_bytes, size):
+  var m = modules
+  | var i = 0
+  | let total_bits = len(codeword_bytes) * 8
+  | var right = size - 1
+  | let _ = while (right >= 1):
+      do
+        right = if (right == 6): 5 else: right
+        | let upward = mod(shift_right(right + 1, 1), 2) == 0
+        | var vert = 0
+        | let _ = while (vert < size):
+            do
+              var j = 0
+              | let _ = while (j < 2):
+                  do
+                    let col = right - j
+                    | let row = if (upward): size - 1 - vert else: vert
+                    | let _ = if (reserved[row][col] == 0 && i < total_bits):
+                        do
+                          let byte_idx = shift_right(i, 3)
+                          | let bit_in_byte = 7 - mod(i, 8)
+                          | let bitval = mod(shift_right(codeword_bytes[byte_idx], bit_in_byte), 2)
+                          | m = _qr_mset(m, row, col, bitval)
+                          | i = i + 1
+                          | m
+                        end
+                      else: m
+                    | j = j + 1
+                    | j
+                  end
+                end
+              | vert = vert + 1
+              | vert
+            end
+          end
+        | right = right - 2
+        | right
+      end
+    end
+  | m
+end
+
+# -- Masking --
+
+def _qr_mask_bit(mask_id, r, c):
+  let cond = if (mask_id == 0): mod(r + c, 2) == 0
+             elif (mask_id == 1): mod(r, 2) == 0
+             elif (mask_id == 2): mod(c, 3) == 0
+             elif (mask_id == 3): mod(r + c, 3) == 0
+             elif (mask_id == 4): mod(shift_right(r, 1) + _qr_idiv(c, 3), 2) == 0
+             elif (mask_id == 5): mod(r * c, 2) + mod(r * c, 3) == 0
+             elif (mask_id == 6): mod(mod(r * c, 2) + mod(r * c, 3), 2) == 0
+             elif (mask_id == 7): mod(mod(r + c, 2) + mod(r * c, 3), 2) == 0
+             else: error("qrcode: invalid mask id: " + to_string(mask_id))
+  | if (cond): 1 else: 0
+end
+
+def _qr_apply_mask(modules, reserved, mask_id, size):
+  var m = modules
+  | var r = 0
+  | let _ = while (r < size):
+      do
+        var c = 0
+        | let _ = while (c < size):
+            do
+              let _ = if (reserved[r][c] == 0 && _qr_mask_bit(mask_id, r, c) == 1):
+                  do m = _qr_mset(m, r, c, _qr_xor(m[r][c], 1)) | m end
+                else: m
+              | c = c + 1
+              | c
+            end
+          end
+        | r = r + 1
+        | r
+      end
+    end
+  | m
+end
+
+# -- Penalty scoring (used to pick the best of the 8 mask patterns) --
+
+def _qr_transpose(m, size):
+  map(range(0, size - 1), fn(c): map(range(0, size - 1), fn(r): m[r][c];);)
+end
+
+def _qr_penalty_rule1_line(line):
+  var penalty = 0
+  | var run_color = -1
+  | var run_len = 0
+  | var i = 0
+  | let n = len(line)
+  | let _ = while (i < n):
+      do
+        let v = line[i]
+        | let _ = if (v == run_color):
+            do run_len = run_len + 1 | run_len end
+          else:
+            do
+              let _ = if (run_len >= 5): penalty = penalty + (run_len - 5) + 3 else: penalty
+              | run_color = v
+              | run_len = 1
+              | run_len
+            end
+        | i = i + 1
+        | i
+      end
+    end
+  | let _ = if (run_len >= 5): penalty = penalty + (run_len - 5) + 3 else: penalty
+  | penalty
+end
+
+def _qr_penalty_rule1(m, size):
+  let rows_penalty = fold(m, 0, fn(acc, row): acc + _qr_penalty_rule1_line(row);)
+  | let cols = _qr_transpose(m, size)
+  | let cols_penalty = fold(cols, 0, fn(acc, col): acc + _qr_penalty_rule1_line(col);)
+  | rows_penalty + cols_penalty
+end
+
+def _qr_penalty_rule2(m, size):
+  var penalty = 0
+  | var r = 0
+  | let _ = while (r < size - 1):
+      do
+        var c = 0
+        | let _ = while (c < size - 1):
+            do
+              let v = m[r][c]
+              | let _ = if (v == m[r][c + 1] && v == m[r + 1][c] && v == m[r + 1][c + 1]):
+                  do penalty = penalty + 3 | penalty end
+                else: penalty
+              | c = c + 1
+              | c
+            end
+          end
+        | r = r + 1
+        | r
+      end
+    end
+  | penalty
+end
+
+def _qr_match_pattern_at(line, idx, pattern):
+  var ok = true
+  | var k = 0
+  | let plen = len(pattern)
+  | let _ = while (k < plen && ok):
+      do
+        let _ = if (line[idx + k] != pattern[k]): ok = false else: ok
+        | k = k + 1
+        | k
+      end
+    end
+  | ok
+end
+
+def _qr_penalty_rule3_line(line):
+  let pattern_a = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0]
+  | let pattern_b = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1]
+  | let n = len(line)
+  | var penalty = 0
+  | var i = 0
+  | let _ = while (i <= n - 11):
+      do
+        let _ = if (_qr_match_pattern_at(line, i, pattern_a)): penalty = penalty + 40 else: penalty
+        | let _ = if (_qr_match_pattern_at(line, i, pattern_b)): penalty = penalty + 40 else: penalty
+        | i = i + 1
+        | i
+      end
+    end
+  | penalty
+end
+
+def _qr_penalty_rule3(m, size):
+  let rows_penalty = fold(m, 0, fn(acc, row): acc + _qr_penalty_rule3_line(row);)
+  | let cols = _qr_transpose(m, size)
+  | let cols_penalty = fold(cols, 0, fn(acc, col): acc + _qr_penalty_rule3_line(col);)
+  | rows_penalty + cols_penalty
+end
+
+def _qr_penalty_rule4(m, size):
+  let total = size * size
+  | let dark = fold(m, 0, fn(acc, row): acc + fold(row, 0, fn(acc2, v): acc2 + v;);)
+  | let percent = dark * 100 / total
+  | let prev = floor(percent / 5) * 5
+  | let next = prev + 5
+  | let a = abs(prev - 50) / 5
+  | let b = abs(next - 50) / 5
+  | let best = if (a < b): a else: b
+  | round(best) * 10
+end
+
+def _qr_penalty(m, size):
+  _qr_penalty_rule1(m, size) + _qr_penalty_rule2(m, size) + _qr_penalty_rule3(m, size) + _qr_penalty_rule4(m, size)
+end
+
+def _qr_select_best_mask(modules, reserved, size):
+  var best_mask = 0
+  | var best_penalty = -1
+  | var best_matrix = modules
+  | var mid = 0
+  | let _ = while (mid <= 7):
+      do
+        let candidate = _qr_apply_mask(modules, reserved, mid, size)
+        | let p = _qr_penalty(candidate, size)
+        | let _ = if (best_penalty == -1 || p < best_penalty):
+            do best_penalty = p | best_mask = mid | best_matrix = candidate | best_matrix end
+          else: best_matrix
+        | mid = mid + 1
+        | mid
+      end
+    end
+  | [best_matrix, best_mask]
+end
+
+def _qr_validate_level(level):
+  if (level == "L" || level == "M" || level == "Q" || level == "H"): level
+  else: error("qrcode: invalid error correction level (expected L, M, Q, or H): " + level)
+end
+
+# Encodes `text` as a QR Code and returns a dict describing the symbol:
+# `{"version": Number, "ecc": String, "mask": Number, "size": Number, "modules": Array}`
+# where `modules` is a `size`x`size` array of arrays of 0/1 (1 = dark module).
+def qr_matrix(text, ecc="M"):
+  let level = _qr_validate_level(upcase(ecc))
+  | let byte_arr = to_array(to_bytes(to_string(text)))
+  | let version = _qr_select_version(len(byte_arr), level)
+  | let info = _qr_block_info(version, level)
+  | let ecc_per_block = info[0]
+  | let g1_blocks = info[1]
+  | let g1_data = info[2]
+  | let g2_blocks = info[3]
+  | let g2_data = info[4]
+  | let capacity_bits = (g1_blocks * g1_data + g2_blocks * g2_data) * 8
+  | let bitstream = _qr_pad_bitstream(_qr_build_bitstream(byte_arr), capacity_bits)
+  | let all_data_codewords = _qr_bits_to_bytes(bitstream)
+  | let exp_t = _qr_gf_exp_table()
+  | let log_t = _qr_gf_log_table()
+  | let data_blocks = _qr_split_blocks(all_data_codewords, g1_blocks, g1_data, g2_blocks, g2_data)
+  | let ecc_blocks = map(data_blocks, fn(b): _qr_rs_encode_block(b, ecc_per_block, exp_t, log_t);)
+  | let all_codewords = _qr_interleave(data_blocks) + _qr_interleave(ecc_blocks)
+  | let size = 17 + 4 * version
+  | let empty = _qr_make_matrix(size, 0)
+  | let [m1, r1] = _qr_place_finder(empty, empty, 0, 0, size)
+  | let [m2, r2] = _qr_place_finder(m1, r1, 0, size - 7, size)
+  | let [m3, r3] = _qr_place_finder(m2, r2, size - 7, 0, size)
+  | let [m4, r4] = _qr_place_timing(m3, r3, size)
+  | let [m5, r5] = _qr_place_alignment(m4, r4, version)
+  | let [m6, r6] = _qr_reserve_format_info(m5, r5, size)
+  | let placed = _qr_place_data(m6, r6, all_codewords, size)
+  | let [best_matrix, best_mask] = _qr_select_best_mask(placed, r6, size)
+  | let format_bits = _qr_format_bits(level, best_mask)
+  | let final_matrix = _qr_place_format(best_matrix, format_bits, size)
+  | {"version": version, "ecc": level, "mask": best_mask, "size": size, "modules": final_matrix}
+end
+
+def _qr_render(modules, size, dark, light, quiet):
+  let border_line = repeat(light, size + quiet * 2)
+  | let border_lines = map(range(1, quiet), fn(x): border_line;)
+  | let body_lines = map(modules, fn(row):
+      repeat(light, quiet) + fold(row, "", fn(acc, v): acc + (if (v == 1): dark else: light);) + repeat(light, quiet);)
+  | join(border_lines + body_lines + border_lines, "\n")
+end
+
+# Generates an ASCII-art QR code for `text` (e.g. a URL) and returns it as a
+# multi-line string, including a quiet-zone border.
+#
+# `ecc` is the error correction level: "L", "M" (default), "Q", or "H".
+# `dark`/`light` control the two characters used to render modules (default
+# `"##"`/`"  "`, two columns wide so modules render roughly square).
+def qr_generate(text, ecc="M", dark="##", light="  "):
+  let info = qr_matrix(text, ecc)
+  | _qr_render(info["modules"], info["size"], dark, light, 4)
+end
+
+def _qr_svg_rects(modules, size, quiet, module_size):
+  var out = ""
+  | var r = 0
+  | let _ = while (r < size):
+      do
+        let row = modules[r]
+        | var c = 0
+        | let _ = while (c < size):
+            do
+              let _ = if (row[c] == 1):
+                  do
+                    let x = (c + quiet) * module_size
+                    | let y = (r + quiet) * module_size
+                    | out = out + "<rect x=\"" + to_string(x) + "\" y=\"" + to_string(y) + "\" width=\"" + to_string(module_size) + "\" height=\"" + to_string(module_size) + "\"/>"
+                    | out
+                  end
+                else: out
+              | c = c + 1
+              | c
+            end
+          end
+        | r = r + 1
+        | r
+      end
+    end
+  | out
+end
+
+# Generates an SVG QR code for `text` (e.g. a URL) and returns it as an SVG
+# document string, including a quiet-zone border.
+#
+# `ecc` is the error correction level: "L", "M" (default), "Q", or "H".
+# `module_size` is the pixel size of one QR module (default `4`). `dark`/
+# `light` are the fill colors for dark/light modules (default black/white).
+def qr_svg(text, ecc="M", module_size=4, dark="#000000", light="#ffffff"):
+  let info = qr_matrix(text, ecc)
+  | let size = info["size"]
+  | let quiet = 4
+  | let dim = (size + quiet * 2) * module_size
+  | let rects = _qr_svg_rects(info["modules"], size, quiet, module_size)
+  | "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 " + to_string(dim) + " " + to_string(dim) + "\" width=\"" + to_string(dim) + "\" height=\"" + to_string(dim) + "\" shape-rendering=\"crispEdges\">" +
+    "<rect width=\"" + to_string(dim) + "\" height=\"" + to_string(dim) + "\" fill=\"" + light + "\"/>" +
+    "<g fill=\"" + dark + "\">" + rects + "</g></svg>"
+end
