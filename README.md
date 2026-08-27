@@ -39,7 +39,7 @@ mq -I raw 'import "qrcode" | qrcode::qr_generate(.)' <<< "https://github.com/har
 Or via [HTTP Import](https://github.com/harehare/mq/blob/main/docs/books/src/reference/modules_and_imports.md#http-imports), no local installation required:
 
 ```sh
-mq -I raw 'import "github.com/harehare/qrcode.mq" | qrcode::qr_generate(.)' <<< "https://github.com/harehare/mq"
+mq --allow-http-import -I raw 'import "github.com/harehare/qrcode.mq" | qrcode::qr_generate(.)' <<< "https://github.com/harehare/mq"
 ```
 
 ## API
